@@ -26,7 +26,15 @@ def code_to_mesh(experiment_directory, checkpoint, keep_normalized=False):
 
     latent_size = specs["CodeLength"]
 
-    decoder = arch.Decoder(latent_size, **specs["NetworkSpecs"])
+    cat_emb_specs = specs.get("CategoryEmbedding", {})
+    do_cat_embedding = cat_emb_specs.get("Enabled", False)
+    if do_cat_embedding:
+        cat_emb_dim = cat_emb_specs.get("EmbeddingDim", 64)
+        effective_latent_size = latent_size + cat_emb_dim
+    else:
+        effective_latent_size = latent_size
+
+    decoder = arch.Decoder(effective_latent_size, **specs["NetworkSpecs"])
 
     decoder = torch.nn.DataParallel(decoder)
 
@@ -43,10 +51,18 @@ def code_to_mesh(experiment_directory, checkpoint, keep_normalized=False):
 
     latent_vectors = ws.load_latent_vectors(experiment_directory, checkpoint)
 
+    if do_cat_embedding:
+        cat_emb_weights = ws.load_category_embeddings_for_inference(
+            experiment_directory, checkpoint
+        ).cuda()
+
     train_split_file = specs["TrainSplit"]
 
     with open(train_split_file, "r") as f:
         train_split = json.load(f)
+
+    if do_cat_embedding:
+        _, cat_name_to_id, _ = deep_sdf.data.build_category_maps(train_split)
 
     data_source = specs["DataSource"]
 
@@ -90,6 +106,11 @@ def code_to_mesh(experiment_directory, checkpoint, keep_normalized=False):
             offset = normalization_params["offset"]
             scale = normalization_params["scale"]
 
+        shape_cat_emb = None
+        if do_cat_embedding:
+            cat_id = cat_name_to_id.get(class_name, 0)
+            shape_cat_emb = cat_emb_weights[cat_id].unsqueeze(0)
+
         with torch.no_grad():
             deep_sdf.mesh.create_mesh(
                 decoder,
@@ -99,6 +120,7 @@ def code_to_mesh(experiment_directory, checkpoint, keep_normalized=False):
                 max_batch=int(2 ** 18),
                 offset=offset,
                 scale=scale,
+                category_embedding=shape_cat_emb,
             )
 
 

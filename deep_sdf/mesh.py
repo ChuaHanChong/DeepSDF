@@ -12,7 +12,8 @@ import deep_sdf.utils
 
 
 def create_mesh(
-    decoder, latent_vec, filename, N=256, max_batch=32 ** 3, offset=None, scale=None
+    decoder, latent_vec, filename, N=256, max_batch=32 ** 3, offset=None, scale=None,
+    category_embedding=None,
 ):
     start = time.time()
     ply_filename = filename
@@ -48,7 +49,8 @@ def create_mesh(
         sample_subset = samples[head : min(head + max_batch, num_samples), 0:3].cuda()
 
         samples[head : min(head + max_batch, num_samples), 3] = (
-            deep_sdf.utils.decode_sdf(decoder, latent_vec, sample_subset)
+            deep_sdf.utils.decode_sdf(decoder, latent_vec, sample_subset,
+                                      category_embedding=category_embedding)
             .squeeze(1)
             .detach()
             .cpu()

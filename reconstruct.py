@@ -23,6 +23,7 @@ def reconstruct(
     num_samples=30000,
     lr=5e-4,
     l2reg=False,
+    category_embedding=None,
 ):
     def adjust_learning_rate(
         initial_lr, optimizer, num_iterations, decreased_by, adjust_lr_every
@@ -63,7 +64,11 @@ def reconstruct(
 
         latent_inputs = latent.expand(num_samples, -1)
 
-        inputs = torch.cat([latent_inputs, xyz], 1).cuda()
+        if category_embedding is not None:
+            cat_inputs = category_embedding.expand(num_samples, -1)
+            inputs = torch.cat([cat_inputs, latent_inputs, xyz], 1).cuda()
+        else:
+            inputs = torch.cat([latent_inputs, xyz], 1).cuda()
 
         pred_sdf = decoder(inputs)
 
@@ -163,7 +168,22 @@ if __name__ == "__main__":
 
     latent_size = specs["CodeLength"]
 
-    decoder = arch.Decoder(latent_size, **specs["NetworkSpecs"])
+    # Category embedding setup for reconstruction
+    cat_emb_specs = specs.get("CategoryEmbedding", {})
+    do_cat_embedding = cat_emb_specs.get("Enabled", False)
+    if do_cat_embedding:
+        cat_emb_dim = cat_emb_specs.get("EmbeddingDim", 64)
+        effective_latent_size = latent_size + cat_emb_dim
+        cat_emb_weights = ws.load_category_embeddings_for_inference(
+            args.experiment_directory, args.checkpoint
+        ).cuda()
+        logging.info("Loaded category embeddings: {} categories, dim {}".format(
+            cat_emb_weights.shape[0], cat_emb_weights.shape[1]))
+    else:
+        effective_latent_size = latent_size
+        cat_emb_weights = None
+
+    decoder = arch.Decoder(effective_latent_size, **specs["NetworkSpecs"])
 
     decoder = torch.nn.DataParallel(decoder)
 
@@ -180,6 +200,17 @@ if __name__ == "__main__":
 
     with open(args.split_filename, "r") as f:
         split = json.load(f)
+
+    # Build category maps if needed (to look up test shape categories)
+    if do_cat_embedding:
+        # Use training split to get consistent category mapping
+        train_split_file = specs.get("TrainSplit", None)
+        if train_split_file is not None:
+            with open(train_split_file, "r") as f:
+                train_split = json.load(f)
+            _, cat_name_to_id, _ = deep_sdf.data.build_category_maps(train_split)
+        else:
+            _, cat_name_to_id, _ = deep_sdf.data.build_category_maps(split)
 
     npz_filenames = deep_sdf.data.get_instance_filenames(args.data_source, split)
 
@@ -249,6 +280,18 @@ if __name__ == "__main__":
             data_sdf[0] = data_sdf[0][torch.randperm(data_sdf[0].shape[0])]
             data_sdf[1] = data_sdf[1][torch.randperm(data_sdf[1].shape[0])]
 
+            # Determine category embedding for this shape
+            shape_cat_emb = None
+            if do_cat_embedding:
+                # npz format: dataset/class_name/instance.npz
+                parts = npz.split(os.sep)
+                if len(parts) >= 2:
+                    shape_class = parts[-2]
+                else:
+                    shape_class = parts[0]
+                cat_id = cat_name_to_id.get(shape_class, 0)
+                shape_cat_emb = cat_emb_weights[cat_id].unsqueeze(0)
+
             start = time.time()
             err, latent = reconstruct(
                 decoder,
@@ -260,6 +303,7 @@ if __name__ == "__main__":
                 num_samples=8000,
                 lr=5e-3,
                 l2reg=True,
+                category_embedding=shape_cat_emb,
             )
             logging.debug("reconstruct time: {}".format(time.time() - start))
             err_sum += err
@@ -277,7 +321,8 @@ if __name__ == "__main__":
                 start = time.time()
                 with torch.no_grad():
                     deep_sdf.mesh.create_mesh(
-                        decoder, latent, mesh_filename, N=256, max_batch=int(2 ** 18)
+                        decoder, latent, mesh_filename, N=256, max_batch=int(2 ** 18),
+                        category_embedding=shape_cat_emb,
                     )
                 logging.debug("total time: {}".format(time.time() - start))
 

@@ -8,6 +8,7 @@ import torch
 model_params_subdir = "ModelParameters"
 optimizer_params_subdir = "OptimizerParameters"
 latent_codes_subdir = "LatentCodes"
+category_embeddings_subdir = "CategoryEmbeddings"
 logs_filename = "Logs.pth"
 reconstructions_subdir = "Reconstructions"
 reconstruction_meshes_subdir = "Meshes"
@@ -57,6 +58,10 @@ def build_decoder(experiment_directory, experiment_specs):
     )
 
     latent_size = experiment_specs["CodeLength"]
+
+    cat_emb_specs = experiment_specs.get("CategoryEmbedding", {})
+    if cat_emb_specs.get("Enabled", False):
+        latent_size = latent_size + cat_emb_specs.get("EmbeddingDim", 64)
 
     decoder = arch.Decoder(latent_size, **experiment_specs["NetworkSpecs"]).cuda()
 
@@ -184,6 +189,65 @@ def get_latent_codes_dir(experiment_dir, create_if_nonexistent=False):
         os.makedirs(dir)
 
     return dir
+
+
+def get_category_embeddings_dir(experiment_dir, create_if_nonexistent=False):
+
+    dir = os.path.join(experiment_dir, category_embeddings_subdir)
+
+    if create_if_nonexistent and not os.path.isdir(dir):
+        os.makedirs(dir)
+
+    return dir
+
+
+def save_category_embeddings(experiment_directory, filename, cat_embeddings, epoch):
+
+    cat_emb_dir = get_category_embeddings_dir(experiment_directory, True)
+
+    torch.save(
+        {"epoch": epoch, "category_embeddings": cat_embeddings.state_dict()},
+        os.path.join(cat_emb_dir, filename),
+    )
+
+
+def load_category_embeddings(experiment_directory, filename, cat_embeddings):
+
+    full_filename = os.path.join(
+        get_category_embeddings_dir(experiment_directory), filename
+    )
+
+    if not os.path.isfile(full_filename):
+        raise Exception(
+            'category embeddings file "{}" does not exist'.format(full_filename)
+        )
+
+    data = torch.load(full_filename)
+
+    cat_embeddings.load_state_dict(data["category_embeddings"])
+
+    return data["epoch"]
+
+
+def load_category_embeddings_for_inference(experiment_directory, checkpoint):
+
+    filename = os.path.join(
+        experiment_directory, category_embeddings_subdir, checkpoint + ".pth"
+    )
+
+    if not os.path.isfile(filename):
+        raise Exception(
+            'category embeddings file "{}" does not exist'.format(filename)
+        )
+
+    data = torch.load(filename)
+
+    num_embeddings, embedding_dim = data["category_embeddings"]["weight"].shape
+
+    cat_emb = torch.nn.Embedding(num_embeddings, embedding_dim)
+    cat_emb.load_state_dict(data["category_embeddings"])
+
+    return cat_emb.weight.data.detach()
 
 
 def get_normalization_params_filename(
