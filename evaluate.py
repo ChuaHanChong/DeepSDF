@@ -12,7 +12,8 @@ import deep_sdf
 import deep_sdf.workspace as ws
 
 
-def evaluate(experiment_directory, checkpoint, data_dir, split_filename):
+def evaluate(experiment_directory, checkpoint, data_dir, split_filename,
+             sampling_method='iid'):
 
     with open(split_filename, "r") as f:
         split = json.load(f)
@@ -58,8 +59,16 @@ def evaluate(experiment_directory, checkpoint, data_dir, split_filename):
                     "normalization params are " + ground_truth_samples_filename
                 )
 
-                ground_truth_points = trimesh.load(ground_truth_samples_filename)
-                reconstruction = trimesh.load(reconstructed_mesh_filename)
+                if not os.path.isfile(reconstructed_mesh_filename):
+                    logging.warning("skipping %s (mesh not found)", instance_name)
+                    continue
+
+                try:
+                    ground_truth_points = trimesh.load(ground_truth_samples_filename)
+                    reconstruction = trimesh.load(reconstructed_mesh_filename)
+                except Exception as e:
+                    logging.warning("skipping %s (load error: %s)", instance_name, str(e))
+                    continue
 
                 normalization_params = np.load(normalization_params_filename)
 
@@ -68,6 +77,7 @@ def evaluate(experiment_directory, checkpoint, data_dir, split_filename):
                     reconstruction,
                     normalization_params["offset"],
                     normalization_params["scale"],
+                    sampling_method=sampling_method,
                 )
 
                 logging.debug("chamfer distance: " + str(chamfer_dist))
@@ -119,6 +129,14 @@ if __name__ == "__main__":
         required=True,
         help="The split to evaluate.",
     )
+    arg_parser.add_argument(
+        "--sampling",
+        dest="sampling_method",
+        default="iid",
+        choices=["iid", "ea"],
+        help="Surface sampling method for Chamfer distance: 'iid' (random, default) "
+             "or 'ea' (Efficient Approximation FPS for uniform coverage).",
+    )
 
     deep_sdf.add_common_args(arg_parser)
 
@@ -131,4 +149,5 @@ if __name__ == "__main__":
         args.checkpoint,
         args.data_source,
         args.split_filename,
+        sampling_method=args.sampling_method,
     )

@@ -95,8 +95,14 @@ def convert_sdf_samples_to_ply(
 
     numpy_3d_sdf_tensor = pytorch_3d_sdf_tensor.numpy()
 
-    verts, faces, normals, values = skimage.measure.marching_cubes_lewiner(
-        numpy_3d_sdf_tensor, level=0.0, spacing=[voxel_size] * 3
+    level = 0.0
+    sdf_min, sdf_max = numpy_3d_sdf_tensor.min(), numpy_3d_sdf_tensor.max()
+    if sdf_min > level or sdf_max < level:
+        level = float((sdf_min + sdf_max) / 2)
+        logging.warning("SDF range [%.4f, %.4f] has no zero-crossing; using level=%.4f", sdf_min, sdf_max, level)
+
+    verts, faces, normals, values = skimage.measure.marching_cubes(
+        numpy_3d_sdf_tensor, level=level, spacing=[voxel_size] * 3
     )
 
     # transform from voxel coordinates to camera coordinates

@@ -11,6 +11,7 @@ import torch
 
 import deep_sdf
 import deep_sdf.workspace as ws
+from deep_sdf.efficient_sampling import sample_sdf_ea
 
 
 def reconstruct(
@@ -24,6 +25,7 @@ def reconstruct(
     lr=5e-4,
     l2reg=False,
     category_embedding=None,
+    use_ea_sampling=False,
 ):
     def adjust_learning_rate(
         initial_lr, optimizer, num_iterations, decreased_by, adjust_lr_every
@@ -47,12 +49,22 @@ def reconstruct(
     loss_num = 0
     loss_l1 = torch.nn.L1Loss()
 
+    # Pre-compute EA-sampled SDF data once if enabled (same uniform selection
+    # for all iterations — spatial uniformity is the goal, not randomness)
+    ea_sdf_data = None
+    if use_ea_sampling:
+        ea_sdf_data = sample_sdf_ea(test_sdf, num_samples, method='euclidean')
+        logging.debug("Using EA-FPS sampling for reconstruction")
+
     for e in range(num_iterations):
 
         decoder.eval()
-        sdf_data = deep_sdf.data.unpack_sdf_samples_from_ram(
-            test_sdf, num_samples
-        ).cuda()
+        if ea_sdf_data is not None:
+            sdf_data = ea_sdf_data.cuda()
+        else:
+            sdf_data = deep_sdf.data.unpack_sdf_samples_from_ram(
+                test_sdf, num_samples
+            ).cuda()
         xyz = sdf_data[:, 0:3]
         sdf_gt = sdf_data[:, 3].unsqueeze(1)
 
@@ -140,6 +152,13 @@ if __name__ == "__main__":
         dest="skip",
         action="store_true",
         help="Skip meshes which have already been reconstructed.",
+    )
+    arg_parser.add_argument(
+        "--ea-sampling",
+        dest="ea_sampling",
+        action="store_true",
+        help="Use Efficient Approximation FPS for spatially uniform SDF sampling "
+             "during reconstruction (instead of random sampling).",
     )
     deep_sdf.add_common_args(arg_parser)
 
@@ -304,6 +323,7 @@ if __name__ == "__main__":
                 lr=5e-3,
                 l2reg=True,
                 category_embedding=shape_cat_emb,
+                use_ea_sampling=args.ea_sampling,
             )
             logging.debug("reconstruct time: {}".format(time.time() - start))
             err_sum += err

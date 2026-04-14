@@ -52,6 +52,33 @@ class WarmupLearningRateSchedule(LearningRateSchedule):
         return self.initial + (self.warmed_up - self.initial) * epoch / self.length
 
 
+class CosineAnnealingLRSchedule(LearningRateSchedule):
+    """Cosine annealing with optional linear warmup.
+
+    LR follows:
+      - Warmup phase (epochs 1..warmup_epochs): linear ramp from min_lr to initial
+      - Cosine phase (epochs warmup_epochs+1..total_epochs): cosine decay from initial to min_lr
+
+    This is standard practice (Loshchilov & Hutter, 2017) and helps models
+    converge to sharper minima in the final training epochs.
+    """
+    def __init__(self, initial, total_epochs, min_lr=1e-6, warmup_epochs=0):
+        self.initial = initial
+        self.total_epochs = total_epochs
+        self.min_lr = min_lr
+        self.warmup_epochs = warmup_epochs
+
+    def get_learning_rate(self, epoch):
+        if epoch <= self.warmup_epochs:
+            # Linear warmup from min_lr to initial
+            if self.warmup_epochs == 0:
+                return self.initial
+            return self.min_lr + (self.initial - self.min_lr) * epoch / self.warmup_epochs
+        # Cosine decay from initial to min_lr
+        progress = (epoch - self.warmup_epochs) / max(1, self.total_epochs - self.warmup_epochs)
+        return self.min_lr + 0.5 * (self.initial - self.min_lr) * (1 + math.cos(math.pi * progress))
+
+
 def get_learning_rate_schedules(specs):
 
     schedule_specs = specs["LearningRateSchedule"]
@@ -74,6 +101,15 @@ def get_learning_rate_schedules(specs):
                     schedule_specs["Initial"],
                     schedule_specs["Final"],
                     schedule_specs["Length"],
+                )
+            )
+        elif schedule_specs["Type"] == "Cosine":
+            schedules.append(
+                CosineAnnealingLRSchedule(
+                    schedule_specs["Initial"],
+                    specs["NumEpochs"],
+                    schedule_specs.get("MinLR", 1e-6),
+                    schedule_specs.get("WarmupEpochs", 0),
                 )
             )
         elif schedule_specs["Type"] == "Constant":
@@ -406,10 +442,14 @@ def main_function(experiment_directory, continue_from, batch_split):
     # that oversamples minority categories so each gets equal representation.
     # =========================================================================
     augmentation_specs = get_spec_with_default(specs, "DataAugmentation", None)
+    use_ea_sampling = get_spec_with_default(specs, "EASampling", False)
+    if use_ea_sampling:
+        logging.info("EA-FPS sampling enabled for training (spatially uniform SDF samples)")
 
     sdf_dataset = deep_sdf.data.SDFSamples(
         data_source, train_split, num_samp_per_scene, load_ram=False,
         augmentation=augmentation_specs,  # Idea 1: passed to __getitem__
+        use_ea_sampling=use_ea_sampling,  # EA-FPS: spatially uniform sample selection
     )
 
     num_data_loader_threads = get_spec_with_default(specs, "DataLoaderThreads", 1)
@@ -455,7 +495,7 @@ def main_function(experiment_directory, continue_from, batch_split):
     # cat_embeddings.weight: (num_categories, cat_emb_dim) e.g. (3, 64)
     # Lookup: cat_embeddings(batch_cat_ids) -> (N, 64)
     if do_cat_embedding:
-        cat_embeddings = torch.nn.Embedding(num_categories, cat_emb_dim).cuda()
+        cat_embeddings = torch.nn.Embedding(num_categories, cat_emb_dim)
         torch.nn.init.normal_(cat_embeddings.weight.data, 0.0, 0.1)
         logging.info("Initialized {} category embeddings of dim {}".format(
             num_categories, cat_emb_dim))
@@ -482,8 +522,43 @@ def main_function(experiment_directory, continue_from, batch_split):
         eikonal_num_samples = eikonal_specs.get("NumUnsupervisedSamples", 4096)
         eikonal_second_order = eikonal_specs.get("SecondOrder", False)
         eikonal_second_order_lambda = eikonal_specs.get("SecondOrderLambda", 0.01)
-        logging.info("Eikonal regularization enabled: lambda={}, samples={}".format(
-            eikonal_lambda, eikonal_num_samples))
+        # IGR-style extensions (Gropp et al., 2020)
+        eikonal_sampling = eikonal_specs.get("SamplingStrategy", "uniform")
+        eikonal_local_frac = eikonal_specs.get("LocalFraction", 0.75)
+        eikonal_local_sigma = eikonal_specs.get("LocalSigma", 0.01)
+        # Warmup schedule
+        warmup_specs = eikonal_specs.get("Warmup", {})
+        do_eikonal_warmup = warmup_specs.get("Enabled", False)
+        warmup_end_epoch = warmup_specs.get("EndEpoch", 10)
+        # Full IGR loss (Gropp et al., 2020): 3 terms with separate sampling
+        #   Term 1: Eikonal on FREE-SPACE points: ||∇f(x)||=1
+        #   Term 2: Surface value on NEAR-SURFACE points: f(x_i)≈0
+        #   Term 3: Normal alignment on NEAR-SURFACE points: ∇f(x_i)=n_i
+        # The normals are computed via autograd (∇f at surface points IS the normal)
+        do_igr_surface = eikonal_specs.get("IGRSurfaceTerms", False)
+        igr_surface_lambda = eikonal_specs.get("IGRSurfaceLambda", 0.01)
+        igr_normal_lambda = eikonal_specs.get("IGRNormalLambda", 0.01)
+        igr_surface_threshold = eikonal_specs.get("IGRSurfaceThreshold", 0.01)
+        # True IGR normal alignment (Gropp et al., 2020): ||grad_f - n_gt||
+        # Requires companion NormalSamples files from scripts/extract_normals.py
+        igr_normals_lambda = eikonal_specs.get("IGRNormalsLambda", 0.0)
+        igr_num_normal_samples = eikonal_specs.get("IGRNumNormalSamples", 4096)
+        do_igr_normals = igr_normals_lambda > 0
+        igr_num_surface_samples = eikonal_specs.get("IGRNumSurfaceSamples", 2048)
+        # IGR: whether to detach latent codes during Eikonal loss
+        # Default True (backward compatible). Set False for correct IGR behavior
+        # where Eikonal gradients flow back to shape codes.
+        eikonal_detach_latent = eikonal_specs.get("EikonalDetachLatent", True)
+        logging.info("Eikonal regularization enabled: lambda={}, samples={}, sampling={}, detach_latent={}".format(
+            eikonal_lambda, eikonal_num_samples, eikonal_sampling, eikonal_detach_latent))
+        if do_igr_surface:
+            logging.info("  Surface terms: surface_lambda={}, normal_lambda={}, threshold={}, surface_samples={}".format(
+                igr_surface_lambda, igr_normal_lambda, igr_surface_threshold, igr_num_surface_samples))
+        if do_igr_normals:
+            logging.info("  True IGR normal alignment: normals_lambda={}, num_normal_samples={}".format(
+                igr_normals_lambda, igr_num_normal_samples))
+        if do_eikonal_warmup:
+            logging.info("  Warmup: ramp over {} epochs".format(warmup_end_epoch))
 
     # =========================================================================
     # Idea 3 — Contrastive Latent Loss config
@@ -500,6 +575,8 @@ def main_function(experiment_directory, continue_from, batch_split):
         contrastive_lambda = contrastive_specs.get("Lambda", 0.01)
         contrastive_margin = contrastive_specs.get("Margin", 1.0)
         contrastive_triplets = contrastive_specs.get("TripletsPerBatch", 32)
+        contrastive_mode = contrastive_specs.get("Mode", "global")  # [ml-opt] contrastive_variants: "global", "batch_local", "soft_weighted", "detached"
+        contrastive_temperature = contrastive_specs.get("Temperature", 0.1)  # [ml-opt] contrastive_variants: for soft_weighted mode
         # Build per-category index lists for triplet mining
         # contrastive_cat_to_indices: {cat_id: [shape_idx, ...]}
         contrastive_cat_to_indices = {}
@@ -512,8 +589,8 @@ def main_function(experiment_directory, continue_from, batch_split):
             logging.warning("Contrastive learning requires >= 2 categories, disabling")
             do_contrastive = False
         else:
-            logging.info("Contrastive learning enabled: lambda={}, margin={}, triplets={}".format(
-                contrastive_lambda, contrastive_margin, contrastive_triplets))
+            logging.info("Contrastive learning enabled: mode={}, lambda={}, margin={}, triplets={}, temp={}".format(
+                contrastive_mode, contrastive_lambda, contrastive_margin, contrastive_triplets, contrastive_temperature))
 
     optimizer_param_groups = [
         {
@@ -600,9 +677,36 @@ def main_function(experiment_directory, continue_from, batch_split):
         )
     )
 
+    # Spline PE progressive training: detect if decoder uses SplinePositionalEncoding
+    # and configure coarse-to-fine schedule (8 → 16 → 32 → 64 over training)
+    spline_progressive = False
+    spline_schedule = []
+    decoder_module = decoder.module if hasattr(decoder, 'module') else decoder
+    if hasattr(decoder_module, 'pos_enc') and hasattr(decoder_module.pos_enc, 'set_effective_resolution'):
+        spline_progressive = True
+        total = num_epochs
+        # Schedule: 8 for first 25%, 16 for next 25%, 32 for next 25%, 64 for last 25%
+        code_num = decoder_module.pos_enc.code_num
+        stages = [max(8, code_num // 8), max(8, code_num // 4), max(8, code_num // 2), code_num]
+        spline_schedule = [(int(total * i / 4), stages[i]) for i in range(4)]
+        logging.info("Spline progressive schedule: {}".format(spline_schedule))
+
     for epoch in range(start_epoch, num_epochs + 1):
 
         start = time.time()
+
+        # Spline PE: update effective resolution based on epoch
+        if spline_progressive:
+            eff_res = spline_schedule[0][1]  # default to first stage
+            for ep_start, res in spline_schedule:
+                if epoch >= ep_start:
+                    eff_res = res
+            decoder_module.pos_enc.set_effective_resolution(eff_res)
+
+        # Progressive Frequency PE: update active frequency count based on epoch
+        if hasattr(decoder_module, 'pos_enc') and decoder_module.pos_enc is not None:
+            if hasattr(decoder_module.pos_enc, 'set_current_epoch'):
+                decoder_module.pos_enc.set_current_epoch(epoch)
 
         logging.info("epoch {}...".format(epoch))
 
@@ -644,6 +748,8 @@ def main_function(experiment_directory, continue_from, batch_split):
 
             # Split into sub-batches for memory efficiency
             xyz = torch.chunk(xyz, batch_split)
+            # [ml-opt] contrastive_variants: save original (B,) indices for batch_local mode
+            batch_shape_indices = indices  # (B,) — unique shape indices before expansion
             # Expand indices: (B,) -> (B*S,) by repeating each index S times
             indices = torch.chunk(
                 indices.unsqueeze(-1).repeat(1, num_samp_per_scene).view(-1),
@@ -679,7 +785,7 @@ def main_function(experiment_directory, continue_from, batch_split):
                 batch_vecs = lat_vecs(indices[i])  # (N, L) = (N, 256)
 
                 if do_cat_embedding:
-                    batch_cat_ids = index_to_cat_id_tensor[indices[i]].cuda()  # (N,) long
+                    batch_cat_ids = index_to_cat_id_tensor[indices[i]]  # (N,) long — stays on CPU like lat_vecs
                     batch_cat_vecs = cat_embeddings(batch_cat_ids)  # (N, C) = (N, 64)
                     input = torch.cat([batch_cat_vecs, batch_vecs, xyz[i]], dim=1)  # (N, C+L+3)
                 else:
@@ -736,51 +842,143 @@ def main_function(experiment_directory, continue_from, batch_split):
                 #   2nd_loss = lambda_2 * mean(laplacian^2)  -> scalar
                 # =============================================================
                 if do_eikonal:
-                    # Sample M random unsupervised points
-                    eik_pts = torch.empty(eikonal_num_samples, 3).uniform_(-1, 1).cuda()  # (M, 3)
-                    eik_pts.requires_grad_(True)  # needed for autograd.grad
+                    # ---- Warmup: ramp lambda from 0 to full over first N epochs ----
+                    if do_eikonal_warmup and epoch < warmup_end_epoch:
+                        eff_eikonal_lambda = eikonal_lambda * min(1.0, epoch / max(1, warmup_end_epoch))
+                    else:
+                        eff_eikonal_lambda = eikonal_lambda
 
-                    # Pick random latents from current batch (detached so eikonal
-                    # loss only updates decoder weights, not latent codes)
-                    random_idx = torch.randint(0, batch_vecs.shape[0], (eikonal_num_samples,))
-                    eik_latents = batch_vecs[random_idx].detach()  # (M, L)
+                    M = eikonal_num_samples  # e.g. 4096
+
+                    # ---- IGR mixed sampling (Gropp et al., 2020) ----
+                    if eikonal_sampling == "igr":
+                        M_local = int(M * eikonal_local_frac)
+                        M_global = M - M_local
+                        # Local: Gaussian noise around training batch points
+                        local_idx = torch.randint(0, xyz[i].shape[0], (M_local,))
+                        local_centers = xyz[i][local_idx].detach().cuda()
+                        local_pts = (local_centers + torch.randn_like(local_centers) * eikonal_local_sigma).clamp(-1, 1)
+                        # Global: uniform random in [-1,1]^3
+                        global_pts = torch.empty(M_global, 3, device=local_pts.device).uniform_(-1, 1)
+                        eik_pts = torch.cat([local_pts, global_pts], dim=0)
+                    else:
+                        eik_pts = torch.empty(M, 3).uniform_(-1, 1).cuda()
+
+                    eik_pts = eik_pts.detach().requires_grad_(True)
+
+                    # Pick random latents from current batch
+                    # IGR: if EikonalDetachLatent=False, gradients flow back to
+                    # shape codes, coupling surface and volume constraints.
+                    random_idx = torch.randint(0, batch_vecs.shape[0], (M,))
+                    if eikonal_detach_latent:
+                        eik_latents = batch_vecs[random_idx].detach().cuda()  # (M, L)
+                    else:
+                        eik_latents = batch_vecs[random_idx].cuda()  # (M, L) — IGR style
 
                     if do_cat_embedding:
-                        eik_cat_vecs = batch_cat_vecs[random_idx].detach()  # (M, C)
-                        eik_input = torch.cat([eik_cat_vecs, eik_latents, eik_pts], dim=1)  # (M, C+L+3)
+                        if eikonal_detach_latent:
+                            eik_cat_vecs = batch_cat_vecs[random_idx].detach().cuda()  # (M, C)
+                        else:
+                            eik_cat_vecs = batch_cat_vecs[random_idx].cuda()  # (M, C) — IGR style
+                        eik_input = torch.cat([eik_cat_vecs, eik_latents, eik_pts], dim=1)
                     else:
-                        eik_input = torch.cat([eik_latents, eik_pts], dim=1)  # (M, L+3)
+                        eik_input = torch.cat([eik_latents, eik_pts], dim=1)
 
                     eik_sdf = decoder(eik_input)  # (M, 1)
 
-                    # Compute spatial gradient: df/d(xyz) via autograd
-                    # create_graph=True keeps the graph so we can backprop through this loss
                     eik_grad = torch.autograd.grad(
-                        outputs=eik_sdf,       # (M, 1)
-                        inputs=eik_pts,        # (M, 3)
+                        outputs=eik_sdf, inputs=eik_pts,
                         grad_outputs=torch.ones_like(eik_sdf),
-                        create_graph=True,
-                        retain_graph=True,
-                    )[0]  # (M, 3) = [df/dx, df/dy, df/dz]
+                        create_graph=True, retain_graph=True,
+                    )[0]  # (M, 3)
 
-                    # Eikonal loss: penalize ||grad|| != 1
-                    # grad_norms: (M,), eik_loss: scalar
-                    eik_loss = eikonal_lambda * torch.mean((eik_grad.norm(dim=1) - 1.0) ** 2)
+                    eik_loss = eff_eikonal_lambda * torch.mean((eik_grad.norm(dim=1) - 1.0) ** 2)
 
                     # Optional 2nd-order: penalize non-zero Laplacian
                     if eikonal_second_order:
                         laplacian = 0.0
                         for d in range(3):
-                            # d^2f/dx_d^2: differentiate eik_grad[:,d] w.r.t. eik_pts, take col d
                             grad2 = torch.autograd.grad(
-                                outputs=eik_grad[:, d],       # (M,)
-                                inputs=eik_pts,               # (M, 3)
+                                outputs=eik_grad[:, d], inputs=eik_pts,
                                 grad_outputs=torch.ones_like(eik_grad[:, d]),
-                                create_graph=True,
-                                retain_graph=True,
-                            )[0][:, d]  # (M,) — d^2f/dx_d^2
-                            laplacian = laplacian + grad2  # accumulate: (M,)
+                                create_graph=True, retain_graph=True,
+                            )[0][:, d]
+                            laplacian = laplacian + grad2
                         eik_loss = eik_loss + eikonal_second_order_lambda * torch.mean(laplacian ** 2)
+
+                    # ---- Full IGR surface terms (Gropp et al., 2020) ----
+                    # Term 2: f(x_i) ≈ 0 at near-surface points
+                    # Term 3: ∇f(x_i) aligns with surface normal at near-surface points
+                    #
+                    # Key insight from lecture: Eikonal applies in the WHOLE 3D space,
+                    # while surface value and normal terms are restricted to surface samples.
+                    # We extract near-surface points (|SDF| < threshold) from the current
+                    # training batch and compute normals via autograd.
+                    #
+                    # Tensor shapes (S = num surface samples):
+                    #   surf_xyz:   (S, 3)  near-surface points, requires_grad=True
+                    #   surf_sdf:   (S, 1)  predicted SDF (should be ≈ 0)
+                    #   surf_grad:  (S, 3)  ∇f at surface (IS the predicted normal)
+                    #   surf_loss:  scalar  = λ_s * mean(|f(x_i)|) + λ_n * mean(1 - cos(∇f, n_gt))
+                    if do_igr_surface:
+                        eff_igr_surface_lambda = igr_surface_lambda
+                        eff_igr_normal_lambda = igr_normal_lambda
+                        if do_eikonal_warmup and epoch < warmup_end_epoch:
+                            warmup_frac = min(1.0, epoch / max(1, warmup_end_epoch))
+                            eff_igr_surface_lambda *= warmup_frac
+                            eff_igr_normal_lambda *= warmup_frac
+
+                        # Find near-surface points from current batch
+                        # xyz[i]: (chunk_size, 3), sdf_gt[i]: (chunk_size, 1)
+                        with torch.no_grad():
+                            sdf_abs = torch.abs(sdf_gt[i].squeeze())  # (chunk_size,)
+                            surface_mask = sdf_abs < igr_surface_threshold
+                            surface_count = surface_mask.sum().item()
+
+                        if surface_count > 10:
+                            # Subsample if too many
+                            S = min(int(surface_count), igr_num_surface_samples)
+                            surface_indices = torch.where(surface_mask)[0]
+                            if surface_count > S:
+                                perm = torch.randperm(surface_count)[:S]
+                                surface_indices = surface_indices[perm]
+
+                            # Extract surface xyz and compute gradients
+                            # Note: xyz[i] and batch_vecs are already the i-th chunk
+                            surf_xyz = xyz[i][surface_indices].detach().cuda().requires_grad_(True)  # (S, 3)
+                            if eikonal_detach_latent:
+                                surf_latents = batch_vecs[surface_indices].detach().cuda()  # (S, L)
+                            else:
+                                surf_latents = batch_vecs[surface_indices].cuda()  # (S, L) — IGR style
+
+                            if do_cat_embedding:
+                                if eikonal_detach_latent:
+                                    surf_cat = batch_cat_vecs[surface_indices].detach()
+                                else:
+                                    surf_cat = batch_cat_vecs[surface_indices]  # IGR style
+                                surf_input = torch.cat([surf_cat, surf_latents, surf_xyz], dim=1)
+                            else:
+                                surf_input = torch.cat([surf_latents, surf_xyz], dim=1)
+
+                            surf_sdf = decoder(surf_input)  # (S, 1)
+
+                            surf_grad = torch.autograd.grad(
+                                outputs=surf_sdf, inputs=surf_xyz,
+                                grad_outputs=torch.ones_like(surf_sdf),
+                                create_graph=True, retain_graph=True,
+                            )[0]  # (S, 3) — predicted normals
+
+                            # Term 2: surface value loss — f(x_i) should be 0
+                            igr_surf_loss = eff_igr_surface_lambda * torch.mean(torch.abs(surf_sdf))
+
+                            # Term 3: surface Eikonal — enforce ||∇f|| = 1 at surface points.
+                            # Fallback when GT normals are not available.
+                            surf_grad_norms = surf_grad.norm(dim=1)  # (S,)
+                            igr_normal_loss = eff_igr_normal_lambda * torch.mean(
+                                (surf_grad_norms - 1.0) ** 2
+                            )
+
+                            eik_loss = eik_loss + igr_surf_loss + igr_normal_loss
 
                     chunk_loss = chunk_loss + eik_loss
 
@@ -788,6 +986,81 @@ def main_function(experiment_directory, continue_from, batch_split):
                 chunk_loss.backward()
 
                 batch_loss += chunk_loss.item()
+
+            # =================================================================
+            # True IGR normal alignment (Gropp et al., 2020)
+            #
+            # Computed AFTER the batch_split loop, per-SHAPE (not per-chunk).
+            # Loads GT surface normals from companion NormalSamples files.
+            # Loss: normals_lambda * mean(||∇f(x_i) - n_gt||)
+            # Reference: repo/IGR/code/shapespace/train.py:72
+            # =================================================================
+            if do_eikonal and do_igr_normals:
+                eff_igr_normals_lambda = igr_normals_lambda
+                if do_eikonal_warmup and epoch < warmup_end_epoch:
+                    warmup_frac = min(1.0, epoch / max(1, warmup_end_epoch))
+                    eff_igr_normals_lambda *= warmup_frac
+
+                igr_total_normal_loss = 0.0
+                igr_total_surface_loss = 0.0
+                igr_shape_count = 0
+
+                for shape_idx in batch_shape_indices.tolist():
+                    # Load GT normals for this shape from companion file
+                    npz_filename = sdf_dataset.npyfiles[shape_idx]
+                    normals_data = deep_sdf.data.load_normals(
+                        data_source, npz_filename, igr_num_normal_samples
+                    )
+                    if normals_data is None:
+                        continue  # No companion file — skip this shape
+
+                    gt_pts, gt_norms = normals_data
+                    gt_pts = gt_pts.cuda().requires_grad_(True)    # (S, 3)
+                    gt_norms = gt_norms.cuda()                      # (S, 3)
+                    S = gt_pts.shape[0]
+
+                    # Pair surface points with this shape's latent code
+                    shape_latent = lat_vecs(torch.tensor([shape_idx]))  # (1, L)
+                    if eikonal_detach_latent:
+                        shape_latent = shape_latent.detach()
+                    igr_latents = shape_latent.expand(S, -1).cuda()  # (S, L)
+
+                    if do_cat_embedding:
+                        cat_id = index_to_cat_id_tensor[shape_idx]
+                        shape_cat_emb = cat_embeddings(cat_id.unsqueeze(0))  # (1, C)
+                        if eikonal_detach_latent:
+                            shape_cat_emb = shape_cat_emb.detach()
+                        igr_cat_vecs = shape_cat_emb.expand(S, -1).cuda()
+                        igr_input = torch.cat([igr_cat_vecs, igr_latents, gt_pts], dim=1)
+                    else:
+                        igr_input = torch.cat([igr_latents, gt_pts], dim=1)
+
+                    igr_sdf = decoder(igr_input)  # (S, 1)
+
+                    # Compute spatial gradient ∇f w.r.t. surface points
+                    igr_grad = torch.autograd.grad(
+                        outputs=igr_sdf, inputs=gt_pts,
+                        grad_outputs=torch.ones_like(igr_sdf),
+                        create_graph=True, retain_graph=True,
+                    )[0]  # (S, 3)
+
+                    # True IGR: ||∇f(x) - n_gt|| (matching reference exactly)
+                    shape_normal_loss = (
+                        (igr_grad - gt_norms).abs()
+                    ).norm(2, dim=1).mean()
+
+                    # Surface value loss: |f(x)| ≈ 0 at surface
+                    shape_surface_loss = torch.mean(torch.abs(igr_sdf))
+
+                    igr_total_normal_loss = igr_total_normal_loss + shape_normal_loss
+                    igr_total_surface_loss = igr_total_surface_loss + shape_surface_loss
+                    igr_shape_count += 1
+
+                if igr_shape_count > 0:
+                    # Match IGR reference: surface value weight=1.0, normals weight=normals_lambda
+                    igr_loss = (eff_igr_normals_lambda * igr_total_normal_loss + igr_total_surface_loss) / igr_shape_count
+                    igr_loss.backward()
+                    batch_loss += igr_loss.item()
 
             # =================================================================
             # Idea 3 — Contrastive Triplet Loss
@@ -819,35 +1092,151 @@ def main_function(experiment_directory, continue_from, batch_split):
             # different-category codes further apart.
             # =================================================================
             if do_contrastive:
-                # Step 1: Mine K triplets
-                anchors = []
-                positives = []
-                negatives = []
-                for _ in range(contrastive_triplets):
-                    anchor_cat = random.choice(contrastive_cat_ids)
-                    anchor_idx = random.choice(contrastive_cat_to_indices[anchor_cat])
-                    pos_idx = random.choice(contrastive_cat_to_indices[anchor_cat])
-                    neg_cat = random.choice([c for c in contrastive_cat_ids if c != anchor_cat])
-                    neg_idx = random.choice(contrastive_cat_to_indices[neg_cat])
-                    anchors.append(anchor_idx)
-                    positives.append(pos_idx)
-                    negatives.append(neg_idx)
+                # =============================================================
+                # [ml-opt] contrastive_variants: Mode switch for contrastive loss
+                # Modes: "global" (original), "batch_local", "soft_weighted", "detached"
+                # =============================================================
 
-                # Step 2: Look up latent vectors from global embedding table
-                anchor_vecs = lat_vecs(torch.tensor(anchors, dtype=torch.long).cuda())  # (K, L)
-                pos_vecs = lat_vecs(torch.tensor(positives, dtype=torch.long).cuda())   # (K, L)
-                neg_vecs = lat_vecs(torch.tensor(negatives, dtype=torch.long).cuda())   # (K, L)
+                if contrastive_mode == "batch_local":  # [ml-opt] contrastive_variants: Mode A
+                    # Mine triplets only from shapes in the current batch
+                    batch_indices_unique = batch_shape_indices.unique().tolist()
+                    batch_cat_map = {}  # {cat_id: [shape_idx, ...]} for batch shapes only
+                    for idx in batch_indices_unique:
+                        cat_id = index_to_cat_id[idx]
+                        batch_cat_map.setdefault(cat_id, []).append(idx)
 
-                # Step 3: Squared L2 distances
-                dist_pos = torch.sum((anchor_vecs - pos_vecs) ** 2, dim=1)  # (K,)
-                dist_neg = torch.sum((anchor_vecs - neg_vecs) ** 2, dim=1)  # (K,)
+                    batch_cats_with_shapes = [c for c, idxs in batch_cat_map.items() if len(idxs) >= 1]
+                    if len(batch_cats_with_shapes) >= 2:
+                        anchors, positives, negatives = [], [], []
+                        for _ in range(contrastive_triplets):
+                            anchor_cat = random.choice(batch_cats_with_shapes)
+                            if len(batch_cat_map[anchor_cat]) < 2:
+                                continue  # need at least 2 shapes in category for anchor+positive
+                            anchor_idx, pos_idx = random.sample(batch_cat_map[anchor_cat], 2)
+                            neg_cat = random.choice([c for c in batch_cats_with_shapes if c != anchor_cat])
+                            neg_idx = random.choice(batch_cat_map[neg_cat])
+                            anchors.append(anchor_idx)
+                            positives.append(pos_idx)
+                            negatives.append(neg_idx)
 
-                # Step 4: Triplet loss = clamp(dist_pos - dist_neg + margin, min=0)
-                triplet_loss = torch.clamp(dist_pos - dist_neg + contrastive_margin, min=0.0)  # (K,)
-                contrastive_loss = contrastive_lambda * torch.mean(triplet_loss)  # scalar
-                contrastive_loss.backward()
+                        if len(anchors) > 0:
+                            anchor_vecs = lat_vecs(torch.tensor(anchors, dtype=torch.long))
+                            pos_vecs = lat_vecs(torch.tensor(positives, dtype=torch.long))
+                            neg_vecs = lat_vecs(torch.tensor(negatives, dtype=torch.long))
+                            dist_pos = torch.sum((anchor_vecs - pos_vecs) ** 2, dim=1)
+                            dist_neg = torch.sum((anchor_vecs - neg_vecs) ** 2, dim=1)
+                            triplet_loss = torch.clamp(dist_pos - dist_neg + contrastive_margin, min=0.0)
+                            contrastive_loss = contrastive_lambda * torch.mean(triplet_loss)
+                            contrastive_loss.backward()
+                            batch_loss += contrastive_loss.item()
 
-                batch_loss += contrastive_loss.item()
+                elif contrastive_mode == "soft_weighted":  # [ml-opt] contrastive_variants: Mode B
+                    import torch.nn.functional as F
+                    # Category-weighted sampling: probability inversely proportional to category size
+                    cat_weights = {cat_id: 1.0 / len(idxs) for cat_id, idxs in contrastive_cat_to_indices.items()}
+                    total_weight = sum(cat_weights.values())
+                    cat_probs = {cat_id: w / total_weight for cat_id, w in cat_weights.items()}
+                    weighted_cats = list(cat_probs.keys())
+                    weighted_probs = [cat_probs[c] for c in weighted_cats]
+
+                    anchors, positives, negatives = [], [], []
+                    for _ in range(contrastive_triplets):
+                        anchor_cat = random.choices(weighted_cats, weights=weighted_probs, k=1)[0]
+                        if len(contrastive_cat_to_indices[anchor_cat]) < 2:
+                            continue
+                        anchor_idx, pos_idx = random.sample(contrastive_cat_to_indices[anchor_cat], 2)
+                        neg_cat = random.choices([c for c in weighted_cats if c != anchor_cat],
+                                                  weights=[cat_probs[c] for c in weighted_cats if c != anchor_cat], k=1)[0]
+                        neg_idx = random.choice(contrastive_cat_to_indices[neg_cat])
+                        anchors.append(anchor_idx)
+                        positives.append(pos_idx)
+                        negatives.append(neg_idx)
+
+                    if len(anchors) > 0:
+                        anchor_vecs = lat_vecs(torch.tensor(anchors, dtype=torch.long))
+                        pos_vecs = lat_vecs(torch.tensor(positives, dtype=torch.long))
+                        neg_vecs = lat_vecs(torch.tensor(negatives, dtype=torch.long))
+
+                        # InfoNCE-style: cosine similarity + temperature
+                        anchor_norm = F.normalize(anchor_vecs, dim=1)
+                        pos_norm = F.normalize(pos_vecs, dim=1)
+                        neg_norm = F.normalize(neg_vecs, dim=1)
+
+                        pos_sim = torch.sum(anchor_norm * pos_norm, dim=1) / contrastive_temperature  # (K,)
+                        neg_sim = torch.sum(anchor_norm * neg_norm, dim=1) / contrastive_temperature  # (K,)
+
+                        # InfoNCE: -log(exp(pos_sim) / (exp(pos_sim) + exp(neg_sim)))
+                        logits = torch.stack([pos_sim, neg_sim], dim=1)  # (K, 2)
+                        labels = torch.zeros(len(anchors), dtype=torch.long, device=logits.device)
+                        contrastive_loss = contrastive_lambda * F.cross_entropy(logits, labels)
+                        contrastive_loss.backward()
+                        batch_loss += contrastive_loss.item()
+
+                elif contrastive_mode == "detached":  # [ml-opt] contrastive_variants: Mode C
+                    anchors, positives, negatives = [], [], []
+                    for _ in range(contrastive_triplets):
+                        anchor_cat = random.choice(contrastive_cat_ids)
+                        if len(contrastive_cat_to_indices[anchor_cat]) < 2:
+                            continue  # need at least 2 shapes for distinct anchor+positive
+                        anchor_idx, pos_idx = random.sample(contrastive_cat_to_indices[anchor_cat], 2)
+                        neg_cat = random.choice([c for c in contrastive_cat_ids if c != anchor_cat])
+                        neg_idx = random.choice(contrastive_cat_to_indices[neg_cat])
+                        anchors.append(anchor_idx)
+                        positives.append(pos_idx)
+                        negatives.append(neg_idx)
+
+                    # DETACH: contrastive doesn't interfere with reconstruction gradients
+                    anchor_vecs = lat_vecs(torch.tensor(anchors, dtype=torch.long)).detach().requires_grad_(True)
+                    pos_vecs = lat_vecs(torch.tensor(positives, dtype=torch.long)).detach().requires_grad_(True)
+                    neg_vecs = lat_vecs(torch.tensor(negatives, dtype=torch.long)).detach().requires_grad_(True)
+
+                    dist_pos = torch.sum((anchor_vecs - pos_vecs) ** 2, dim=1)
+                    dist_neg = torch.sum((anchor_vecs - neg_vecs) ** 2, dim=1)
+                    triplet_loss = torch.clamp(dist_pos - dist_neg + contrastive_margin, min=0.0)
+                    contrastive_loss = contrastive_lambda * torch.mean(triplet_loss)
+                    contrastive_loss.backward()
+
+                    # Manually apply contrastive gradients to the embedding
+                    with torch.no_grad():
+                        lr = lr_schedules[1].get_learning_rate(epoch)  # latent code learning rate
+                        for vec, idx_list in [(anchor_vecs, anchors), (pos_vecs, positives), (neg_vecs, negatives)]:
+                            if vec.grad is not None:
+                                for j, idx in enumerate(idx_list):
+                                    lat_vecs.weight.data[idx] -= lr * vec.grad[j]
+
+                    batch_loss += contrastive_loss.item()
+
+                else:  # mode == "global" (original behavior)  # [ml-opt] contrastive_variants: backward compatible
+                    # Step 1: Mine K triplets from global embedding table
+                    anchors = []
+                    positives = []
+                    negatives = []
+                    for _ in range(contrastive_triplets):
+                        anchor_cat = random.choice(contrastive_cat_ids)
+                        if len(contrastive_cat_to_indices[anchor_cat]) < 2:
+                            continue  # need at least 2 shapes for distinct anchor+positive
+                        anchor_idx, pos_idx = random.sample(contrastive_cat_to_indices[anchor_cat], 2)
+                        neg_cat = random.choice([c for c in contrastive_cat_ids if c != anchor_cat])
+                        neg_idx = random.choice(contrastive_cat_to_indices[neg_cat])
+                        anchors.append(anchor_idx)
+                        positives.append(pos_idx)
+                        negatives.append(neg_idx)
+
+                    # Step 2: Look up latent vectors from global embedding table
+                    anchor_vecs = lat_vecs(torch.tensor(anchors, dtype=torch.long))  # (K, L)
+                    pos_vecs = lat_vecs(torch.tensor(positives, dtype=torch.long))   # (K, L)
+                    neg_vecs = lat_vecs(torch.tensor(negatives, dtype=torch.long))   # (K, L)
+
+                    # Step 3: Squared L2 distances
+                    dist_pos = torch.sum((anchor_vecs - pos_vecs) ** 2, dim=1)  # (K,)
+                    dist_neg = torch.sum((anchor_vecs - neg_vecs) ** 2, dim=1)  # (K,)
+
+                    # Step 4: Triplet loss = clamp(dist_pos - dist_neg + margin, min=0)
+                    triplet_loss = torch.clamp(dist_pos - dist_neg + contrastive_margin, min=0.0)  # (K,)
+                    contrastive_loss = contrastive_lambda * torch.mean(triplet_loss)  # scalar
+                    contrastive_loss.backward()
+
+                    batch_loss += contrastive_loss.item()
 
             logging.debug("loss = {}".format(batch_loss))
 

@@ -11,6 +11,7 @@ import torch
 import torch.utils.data
 
 import deep_sdf.workspace as ws
+from deep_sdf.efficient_sampling import efficient_approx_fps_euclidean
 
 
 # =============================================================================
@@ -239,7 +240,7 @@ def read_sdf_samples_into_ram(filename):
     return [pos_tensor, neg_tensor]
 
 
-def unpack_sdf_samples(filename, subsample=None):
+def unpack_sdf_samples(filename, subsample=None, use_ea_sampling=False):
     npz = np.load(filename)
     if subsample is None:
         return npz
@@ -248,6 +249,19 @@ def unpack_sdf_samples(filename, subsample=None):
 
     # split the sample into half
     half = int(subsample / 2)
+
+    if use_ea_sampling:
+        # EA-FPS: select spatially uniform samples from the FULL set
+        # instead of random indexing, ensuring representative geometry per batch
+        pos_xyz = pos_tensor[:, :3].numpy()
+        pos_idx = efficient_approx_fps_euclidean(pos_xyz, half)
+        sample_pos = pos_tensor[pos_idx]
+
+        neg_xyz = neg_tensor[:, :3].numpy()
+        neg_idx = efficient_approx_fps_euclidean(neg_xyz, half)
+        sample_neg = neg_tensor[neg_idx]
+
+        return torch.cat([sample_pos, sample_neg], 0)
 
     random_pos = (torch.rand(half) * pos_tensor.shape[0]).long()
     random_neg = (torch.rand(half) * neg_tensor.shape[0]).long()
@@ -260,7 +274,7 @@ def unpack_sdf_samples(filename, subsample=None):
     return samples
 
 
-def unpack_sdf_samples_from_ram(data, subsample=None):
+def unpack_sdf_samples_from_ram(data, subsample=None, use_ea_sampling=False):
     if subsample is None:
         return data
     pos_tensor = data[0]
@@ -269,6 +283,21 @@ def unpack_sdf_samples_from_ram(data, subsample=None):
     # split the sample into half
     half = int(subsample / 2)
 
+    if use_ea_sampling:
+        # Efficient Approximation FPS: select spatially uniform SDF samples
+        # instead of contiguous slices, ensuring the model sees representative
+        # geometry every batch (covers the full surface, not clustered regions)
+        pos_xyz = pos_tensor[:, :3].numpy()
+        pos_idx = efficient_approx_fps_euclidean(pos_xyz, half)
+        sample_pos = pos_tensor[pos_idx]
+
+        neg_xyz = neg_tensor[:, :3].numpy()
+        neg_idx = efficient_approx_fps_euclidean(neg_xyz, half)
+        sample_neg = neg_tensor[neg_idx]
+
+        return torch.cat([sample_pos, sample_neg], 0)
+
+    # Default: contiguous slice sampling
     pos_size = pos_tensor.shape[0]
     neg_size = neg_tensor.shape[0]
 
@@ -287,6 +316,41 @@ def unpack_sdf_samples_from_ram(data, subsample=None):
     return samples
 
 
+def load_normals(data_source, npz_filename, num_samples):
+    """Load surface points and normals from a companion NormalSamples file.
+
+    Returns (points, normals) tensors or None if the file doesn't exist.
+    Matches IGR data format: surface points paired with face normals.
+
+    Args:
+        data_source: Root data directory (contains NormalSamples/)
+        npz_filename: Relative path like "ShapeNetV2/03001627/shape.npz"
+        num_samples: Number of surface points to randomly subsample
+
+    Returns:
+        (points: Tensor[S,3], normals: Tensor[S,3]) or None
+    """
+    normals_path = os.path.join(data_source, ws.normal_samples_subdir, npz_filename)
+    if not os.path.isfile(normals_path):
+        return None
+
+    try:
+        data = np.load(normals_path)
+        points = torch.from_numpy(data["points"])    # (N, 3)
+        normals = torch.from_numpy(data["normals"])   # (N, 3)
+    except Exception:
+        return None
+
+    # Subsample
+    N = points.shape[0]
+    if N > num_samples:
+        idx = torch.randperm(N)[:num_samples]
+        points = points[idx]
+        normals = normals[idx]
+
+    return points, normals
+
+
 class SDFSamples(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -297,9 +361,11 @@ class SDFSamples(torch.utils.data.Dataset):
         print_filename=False,
         num_files=1000000,
         augmentation=None,
+        use_ea_sampling=False,
     ):
         self.subsample = subsample
         self.augmentation = augmentation
+        self.use_ea_sampling = use_ea_sampling
 
         self.data_source = data_source
         self.npyfiles = get_instance_filenames(data_source, split)
@@ -335,9 +401,15 @@ class SDFSamples(torch.utils.data.Dataset):
             self.data_source, ws.sdf_samples_subdir, self.npyfiles[idx]
         )
         if self.load_ram:
-            samples = unpack_sdf_samples_from_ram(self.loaded_data[idx], self.subsample)
+            samples = unpack_sdf_samples_from_ram(
+                self.loaded_data[idx], self.subsample,
+                use_ea_sampling=self.use_ea_sampling
+            )
         else:
-            samples = unpack_sdf_samples(filename, self.subsample)
+            samples = unpack_sdf_samples(
+                filename, self.subsample,
+                use_ea_sampling=self.use_ea_sampling
+            )
 
         # Idea 1: Apply data augmentation on-the-fly after unpacking
         # samples: (S, 4) -> augment_sdf_samples -> (S, 4)  shape unchanged
