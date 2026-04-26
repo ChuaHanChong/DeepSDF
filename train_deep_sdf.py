@@ -491,6 +491,14 @@ def main_function(experiment_directory, continue_from, batch_split):
         get_spec_with_default(specs, "CodeInitStdDev", 1.0) / math.sqrt(latent_size),
     )
 
+    # IGR (Gropp et al., 2020): zero-init latent codes when geometric_init is enabled.
+    # Geometric init makes f(x) ≈ ||x|| - 1 (sphere SDF) ONLY when latent = 0.
+    # With random latent codes, the first layer mixes random + xyz, breaking the sphere.
+    # IGR reference (shapespace/train.py:269): lat_vecs = torch.zeros(N, L)
+    if specs["NetworkSpecs"].get("geometric_init", False):
+        torch.nn.init.zeros_(lat_vecs.weight.data)
+        logging.info("IGR: latent codes zero-initialized (geometric_init=True)")
+
     # Idea 4: Category embedding table — one embedding per category
     # cat_embeddings.weight: (num_categories, cat_emb_dim) e.g. (3, 64)
     # Lookup: cat_embeddings(batch_cat_ids) -> (N, 64)
@@ -892,7 +900,7 @@ def main_function(experiment_directory, continue_from, batch_split):
                         create_graph=True, retain_graph=True,
                     )[0]  # (M, 3)
 
-                    eik_loss = eff_eikonal_lambda * torch.mean((eik_grad.norm(dim=1) - 1.0) ** 2)
+                    eik_loss = eff_eikonal_lambda * torch.mean((eik_grad.norm(dim=1) - 1.0) ** 2) / batch_split
 
                     # Optional 2nd-order: penalize non-zero Laplacian
                     if eikonal_second_order:
@@ -904,7 +912,7 @@ def main_function(experiment_directory, continue_from, batch_split):
                                 create_graph=True, retain_graph=True,
                             )[0][:, d]
                             laplacian = laplacian + grad2
-                        eik_loss = eik_loss + eikonal_second_order_lambda * torch.mean(laplacian ** 2)
+                        eik_loss = eik_loss + eikonal_second_order_lambda * torch.mean(laplacian ** 2) / batch_split
 
                     # ---- Full IGR surface terms (Gropp et al., 2020) ----
                     # Term 2: f(x_i) ≈ 0 at near-surface points
@@ -969,14 +977,14 @@ def main_function(experiment_directory, continue_from, batch_split):
                             )[0]  # (S, 3) — predicted normals
 
                             # Term 2: surface value loss — f(x_i) should be 0
-                            igr_surf_loss = eff_igr_surface_lambda * torch.mean(torch.abs(surf_sdf))
+                            igr_surf_loss = eff_igr_surface_lambda * torch.mean(torch.abs(surf_sdf)) / batch_split
 
                             # Term 3: surface Eikonal — enforce ||∇f|| = 1 at surface points.
                             # Fallback when GT normals are not available.
                             surf_grad_norms = surf_grad.norm(dim=1)  # (S,)
                             igr_normal_loss = eff_igr_normal_lambda * torch.mean(
                                 (surf_grad_norms - 1.0) ** 2
-                            )
+                            ) / batch_split
 
                             eik_loss = eik_loss + igr_surf_loss + igr_normal_loss
 

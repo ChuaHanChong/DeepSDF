@@ -67,13 +67,12 @@ class PositionalEncoding(nn.Module):
 # B ~ N(0, scale^2) is sampled once at init and never updated.
 # =============================================================================
 class RandomFourierFeatures(nn.Module):
-    def __init__(self, num_frequencies=64, scale=10.0, input_dim=3):
+    def __init__(self, num_frequencies=128, scale=4.0, input_dim=3):
         super().__init__()
         self.output_dim = 2 * num_frequencies
-        # Paper: γ(v) = [cos(2πBv), sin(2πBv)], B ~ N(0, σ²I)
-        # Absorb 2π into B so forward is just x @ B.T
-        # Note: uses 2π scaling (matching Tancik et al., 2020 paper formula).
-        # The SplinePosEnc reference uses π for [-1,1] inputs — see docs for discussion.
+        # Paper (Tancik et al. 2020): γ(v) = [cos(2πBv), sin(2πBv)], B ~ N(0, σ²I)
+        # Absorb 2π into B so forward is just x @ B.T.
+        # With scale=σ: effective bandwidth = 2πσ. Paper optimal σ≈10 for 3D shapes.
         B = torch.randn(num_frequencies, input_dim) * scale * 2.0 * np.pi
         self.register_buffer("B", B)
 
@@ -90,23 +89,28 @@ class RandomFourierFeatures(nn.Module):
 # output = MLP(r_x)
 # =============================================================================
 class LearnableFourierFeatures(nn.Module):
-    def __init__(self, fourier_dim=128, hidden_dim=64, output_dim=64,
+    def __init__(self, fourier_dim=128, hidden_dim=32, output_dim=128,
                  gamma=10.0, input_dim=3):
         super().__init__()
         self.output_dim = output_dim
-        # Reference: 1/sqrt(F_dim) where F_dim is post-cat dim (2*fourier_dim)
-        self.scale = 1.0 / ((2 * fourier_dim) ** 0.5)
+        # Reference (Li et al., 2021): W_r projects to F_dim//2, then cos/sin
+        # doubles to F_dim. Scale = 1/sqrt(F_dim).
+        # Matching: learnable_fourier_pos_encoding.py line 28, 54
+        half_dim = fourier_dim // 2
+        self.scale = 1.0 / (fourier_dim ** 0.5)
         # Reference: nn.init.normal_(Wr.weight, mean=0, std=gamma^-2)
-        self.W_r = nn.Parameter(torch.randn(fourier_dim, input_dim) * (gamma ** -2))
+        self.W_r = nn.Linear(input_dim, half_dim, bias=False)
+        nn.init.normal_(self.W_r.weight, mean=0, std=gamma ** -2)
+        # MLP: F_dim → hidden → output (reference uses H_dim=32, D=F_dim)
         self.mlp = nn.Sequential(
-            nn.Linear(2 * fourier_dim, hidden_dim),
+            nn.Linear(fourier_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, output_dim),
         )
 
     def forward(self, x):
-        proj = x @ self.W_r.T  # (N, fourier_dim)
-        r_x = self.scale * torch.cat([torch.cos(proj), torch.sin(proj)], dim=-1)
+        proj = self.W_r(x)  # (N, half_dim)
+        r_x = self.scale * torch.cat([torch.cos(proj), torch.sin(proj)], dim=-1)  # (N, fourier_dim)
         return self.mlp(r_x)  # (N, output_dim)
 
 
@@ -430,14 +434,14 @@ class Decoder(nn.Module):
         # Spline PE params
         spline_code_num=64,
         spline_code_channel=64,
-        # LFF params
+        # LFF params (matching Li et al., 2021 reference architecture)
         lff_fourier_dim=128,
-        lff_hidden_dim=64,
-        lff_output_dim=64,
+        lff_hidden_dim=32,
+        lff_output_dim=128,
         lff_gamma=10.0,
-        # RFF params
-        rff_num_frequencies=64,
-        rff_scale=10.0,
+        # RFF params (matching SplinePosEnc SDF reference: scale=4, π, 128 freqs)
+        rff_num_frequencies=128,
+        rff_scale=4.0,
         # IGR params (Gropp et al., 2020)
         activation="relu",
         activation_beta=100,

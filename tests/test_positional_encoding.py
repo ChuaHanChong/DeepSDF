@@ -247,8 +247,8 @@ class TestRandomFourierFeatures:
 
     def test_B_scale(self):
         torch.manual_seed(42)
-        rff = RandomFourierFeatures(num_frequencies=64, scale=10.0, input_dim=3)
-        expected_std = 10.0 * 2.0 * torch.pi  # ~62.83
+        rff = RandomFourierFeatures(num_frequencies=64, scale=4.0, input_dim=3)
+        expected_std = 4.0 * 2.0 * torch.pi  # ~25.13 (2π matching Tancik et al. 2020)
         actual_std = rff.B.std().item()
         assert abs(actual_std - expected_std) / expected_std < 0.20
 
@@ -304,30 +304,32 @@ class TestLearnableFourierFeatures:
     def lff(self):
         torch.manual_seed(42)
         return LearnableFourierFeatures(
-            fourier_dim=128, hidden_dim=64, output_dim=64, gamma=10.0, input_dim=3
+            fourier_dim=128, hidden_dim=32, output_dim=128, gamma=10.0, input_dim=3
         )
 
     def test_output_dim(self, lff):
-        assert lff.output_dim == 64
+        assert lff.output_dim == 128
 
     def test_output_shape(self, lff):
         x = torch.randn(10, 3)
         out = lff(x)
-        assert out.shape == (10, 64)
+        assert out.shape == (10, 128)
 
     def test_W_r_is_parameter(self, lff):
-        assert "W_r" in dict(lff.named_parameters())
+        # W_r is now nn.Linear (matching reference), so params are under "W_r.weight"
+        assert "W_r.weight" in dict(lff.named_parameters())
 
     def test_W_r_shape(self, lff):
-        assert lff.W_r.shape == (128, 3)
+        # Reference: W_r projects to fourier_dim//2 = 64, shape (64, 3)
+        assert lff.W_r.weight.shape == (64, 3)
 
     def test_W_r_init_scale(self):
         torch.manual_seed(42)
         lff = LearnableFourierFeatures(
-            fourier_dim=128, hidden_dim=64, output_dim=64, gamma=10.0, input_dim=3
+            fourier_dim=128, hidden_dim=32, output_dim=128, gamma=10.0, input_dim=3
         )
         expected_std = 10.0 ** -2  # 0.01
-        actual_std = lff.W_r.std().item()
+        actual_std = lff.W_r.weight.std().item()
         assert abs(actual_std - expected_std) / expected_std < 0.50
 
     def test_mlp_structure(self, lff):
@@ -340,11 +342,12 @@ class TestLearnableFourierFeatures:
         x = torch.randn(10, 3)
         out = lff(x)
         out.sum().backward()
-        assert lff.W_r.grad is not None
+        assert lff.W_r.weight.grad is not None
         assert lff.mlp[0].weight.grad is not None
 
     def test_scale_factor(self, lff):
-        expected_scale = 1.0 / ((2 * 128) ** 0.5)
+        # Reference: 1/sqrt(F_dim) where F_dim=128 (post-cat dimension)
+        expected_scale = 1.0 / (128 ** 0.5)
         assert abs(lff.scale - expected_scale) < 1e-9
 
     def test_decoder_integration(self):
@@ -355,8 +358,8 @@ class TestLearnableFourierFeatures:
             positional_encoding=True,
             positional_encoding_type="lff",
             lff_fourier_dim=128,
-            lff_hidden_dim=64,
-            lff_output_dim=64,
+            lff_hidden_dim=32,
+            lff_output_dim=128,
         ).eval()
         x = torch.randn(4, 259)  # latent(256) + xyz(3)
         out = dec(x)
@@ -365,7 +368,7 @@ class TestLearnableFourierFeatures:
     def test_fourier_feature_structure(self, lff):
         x = torch.randn(5, 3)
         out = lff(x)
-        assert out.shape == (5, 64)
+        assert out.shape == (5, 128)  # output_dim=128 matching reference
 
 
 class TestSplinePositionalEncoding:
